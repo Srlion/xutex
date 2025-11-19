@@ -1,4 +1,4 @@
-use crate::{QueueStructure, SignalQueue};
+use crate::QueueStructure;
 use crossbeam_queue::ArrayQueue;
 
 const QUEUE_POOL_CAPACITY: usize = 128;
@@ -10,7 +10,7 @@ fn get_queue_allocator() -> &'static ArrayQueue<Box<QueueStructure>> {
     QUEUE_ALLOCATOR.get_or_init(|| {
         let queue = ArrayQueue::new(QUEUE_POOL_CAPACITY);
         for _ in 0..QUEUE_POOL_CAPACITY {
-            let _ = queue.push(Box::new(std::sync::Mutex::new(SignalQueue::new())));
+            let _ = queue.push(Box::new(QueueStructure::new()));
         }
         queue
     })
@@ -20,7 +20,7 @@ fn get_queue_allocator() -> &'static ArrayQueue<Box<QueueStructure>> {
 pub(crate) fn allocate_queue() -> Box<QueueStructure> {
     get_queue_allocator()
         .pop()
-        .unwrap_or_else(|| Box::new(std::sync::Mutex::new(SignalQueue::new())))
+        .unwrap_or_else(|| Box::new(QueueStructure::new()))
 }
 
 #[inline(always)]

@@ -63,18 +63,23 @@ Convert seamlessly between sync and async:
 ```rust
 use xutex::{Mutex, AsyncMutex};
 
-// Sync → Async
-let sync_mutex = Mutex::new(42);
-let async_ref: &AsyncMutex<_> = sync_mutex.as_async();
-let guard = async_ref.lock().await;
+async fn example(mutex: &Mutex<i32>) {
+  let async_ref: &AsyncMutex<_> = mutex.as_async();
+  let guard = async_ref.lock().await;
+}
+```
 
-// Async → Sync
-let async_mutex = AsyncMutex::new(5);
-let sync_ref: &Mutex<_> = async_mutex.as_sync();
-let guard = sync_ref.lock();
-
-// Block on async mutex from sync context
-let guard = async_mutex.lock_sync();
+```rust
+use xutex::{Mutex, AsyncMutex};
+fn example(){
+  // Async → Sync
+  let async_mutex = AsyncMutex::new(5);
+  let sync_ref: &Mutex<_> = async_mutex.as_sync();
+  let guard = sync_ref.lock();
+  drop(guard);
+  // Block on async mutex from sync context
+  let guard = async_mutex.lock_sync();
+}
 ```
 
 ## Performance Characteristics
@@ -119,7 +124,7 @@ cargo bench
 
 ### Architecture
 
-```
+```text
 ┌─────────────────────────────────────────────┐
 │  Mutex<T> / AsyncMutex<T>                   │
 │  ┌───────────────────────────────────────┐  │
@@ -182,13 +187,15 @@ Each waiter tracks its state through atomic transitions:
 
 ### `AsyncMutex<T>`
 
-| Method         | Description                                   |
-| -------------- | --------------------------------------------- |
-| `new(data: T)` | Create a new asynchronous mutex               |
-| `lock()`       | Acquire the lock (returns `Future`)           |
-| `try_lock()`   | Attempt non-blocking acquisition              |
-| `lock_sync()`  | Acquire synchronously (blocks current thread) |
-| `as_sync()`    | View as `&Mutex<T>`                           |
+| Method          | Description                                     |
+| --------------- | ----------------------------------------------- |
+| `new(data: T)`  | Create a new asynchronous mutex                 |
+| `lock()`        | Acquire the lock (returns `Future`)             |
+| `try_lock()`    | Attempt non-blocking acquisition                |
+| `lock_sync()`   | Acquire synchronously (blocks current thread)   |
+| `as_sync()`     | View as `&Mutex<T>`                             |
+| `to_sync()`     | Convert to `Mutex<T>`                           |
+| `to_sync_arc()` | Convert `Arc<AsyncMutex<T>>` to `Arc<Mutex<T>>` |
 
 ### `MutexGuard<'a, T>`
 

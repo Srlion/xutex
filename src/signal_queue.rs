@@ -14,7 +14,7 @@ unsafe impl Send for SignalQueue {}
 impl SignalQueue {
     /// Creates a new empty SignalQueue.
     #[inline(always)]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             first: None,
             last: None,
@@ -34,7 +34,7 @@ impl SignalQueue {
         } else {
             unsafe {
                 // SAFETY: self.last is not null and guaranteed to be valid
-                (*self.last.unwrap_unchecked().as_mut()).next = Some(entry);
+                self.last.unwrap_unchecked().as_mut().next = Some(entry);
             }
             self.last = Some(entry);
             false
@@ -67,16 +67,16 @@ impl SignalQueue {
     pub fn remove(&mut self, entry: NonNull<Signal>) -> bool {
         let mut cur = self.first;
         let mut prev: Option<NonNull<Signal>> = None;
-        while likely(!cur.is_none()) {
+        while likely(cur.is_some()) {
             let mut cur_ptr = cur.unwrap();
             if cur_ptr == entry {
-                if !prev.is_none() {
+                if let Some(mut prev) = prev {
                     unsafe {
                         // SAFETY: prev is not null and guaranteed to be valid
-                        (*prev.unwrap().as_mut()).next = (*cur_ptr.as_mut()).next;
+                        prev.as_mut().next = cur_ptr.as_mut().next;
                     }
                 } else {
-                    self.first = unsafe { (*cur_ptr.as_mut()).next };
+                    self.first = unsafe { cur_ptr.as_mut().next };
                 }
                 if self.last == Some(cur_ptr) {
                     self.last = prev;
@@ -86,7 +86,7 @@ impl SignalQueue {
             prev = Some(cur_ptr);
             cur = unsafe {
                 // SAFETY: current is not null and guaranteed to be valid
-                (*cur_ptr.as_mut()).next
+                cur_ptr.as_mut().next
             };
         }
         false

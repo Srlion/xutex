@@ -1,6 +1,6 @@
-#[doc = include_str!("../README.md")]
+#![warn(missing_docs)]
+#![doc = include_str!("../README.md")]
 use std::ptr::NonNull;
-#[warn(missing_docs)]
 use std::{
     cell::UnsafeCell,
     marker::PhantomPinned,
@@ -24,7 +24,7 @@ use branches::{likely, unlikely};
 use std::sync::Arc;
 
 #[repr(C)]
-pub struct Signal {
+pub(crate) struct Signal {
     next: Option<NonNull<Signal>>,
     value: AtomicUsize,
     waker: DynamicWaker,
@@ -39,12 +39,10 @@ pub struct Signal {
 ///
 /// This function converts the raw pointer into a reference and then obtains a
 /// `MutexGuard` without performing poisoning checks.
-pub unsafe fn lock_unpoisoned<'a, T>(
-    m: *const std::sync::Mutex<T>,
-) -> std::sync::MutexGuard<'a, T> {
+unsafe fn lock_unpoisoned<'a>(m: *const QueueStructure) -> std::sync::MutexGuard<'a, SignalQueue> {
     // SAFETY: the caller ensures `m` is valid for `'a`.
     unsafe {
-        match (&*m).lock() {
+        match (&*m).inner.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
@@ -70,7 +68,53 @@ impl Signal {
     }
 }
 
-type QueueStructure = std::sync::Mutex<SignalQueue>;
+struct QueueStructure {
+    pub counter: AtomicUsize,
+    pub inner: std::sync::Mutex<SignalQueue>,
+}
+
+impl QueueStructure {
+    const fn new() -> Self {
+        Self {
+            counter: AtomicUsize::new(0),
+            inner: std::sync::Mutex::new(SignalQueue::new()),
+        }
+    }
+    pub fn acquire_guard(&self) -> QueueGuard<'_> {
+        self.counter
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        QueueGuard {
+            counter: &self.counter,
+        }
+    }
+    pub fn read_counter(&self) -> usize {
+        self.counter.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[must_use]
+pub(crate) struct QueueGuard<'a> {
+    pub counter: &'a AtomicUsize,
+}
+
+impl QueueGuard<'_> {
+    /// Releases the queue guard and decrements the internal counter.
+    ///
+    /// This method consumes the `QueueGuard` and performs cleanup by:
+    /// - Decrementing the associated atomic counter using release ordering
+    /// - Dropping the provided mutex guard to release the lock on the signal
+    ///   queue
+    ///
+    /// # Arguments
+    ///
+    /// * `mutex_guard` - A mutex guard protecting the `SignalQueue` that will
+    ///   be released
+    pub fn release(self, mutex_guard: std::sync::MutexGuard<'_, SignalQueue>) {
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+        drop(mutex_guard)
+    }
+}
 
 const LOCKED: *mut QueueStructure = usize::MAX as *mut _;
 const UNLOCKED: *mut QueueStructure = std::ptr::null_mut();
@@ -124,6 +168,63 @@ impl<T> MutexInternal<T> {
     }
 }
 
+/// A future that represents a pending asynchronous lock acquisition request.
+///
+/// This struct is returned by [`AsyncMutex::lock()`] and
+/// [`Mutex::lock_async()`] and implements [`Future`] to provide async/await
+/// support for mutex locking. When polled, it will either immediately return a
+/// [`MutexGuard`] if the lock is available, or register itself in the mutex's
+/// wait queue and return [`Poll::Pending`] until the lock becomes available.
+///
+/// ## Pinning Requirements
+///
+/// This type contains [`PhantomPinned`] and is `!Unpin`, meaning it cannot be
+/// moved once pinned. This is necessary because the struct contains a
+/// [`Signal`] that may be linked into the mutex's wait queue, and moving it
+/// would invalidate the queue pointers.
+///
+/// ## Memory Safety
+///
+/// The struct maintains a reference to the mutex and embeds a [`Signal`] entry
+/// that may be inserted into the mutex's internal wait queue. If the future is
+/// dropped while waiting, it will automatically remove itself from the queue
+/// or wait synchronously for the lock to avoid use-after-free issues.
+///
+/// ## Cancellation Safety
+///
+/// This future handles cancellation (dropping while pending) safely by either:
+/// 1. Successfully removing itself from the wait queue, or
+/// 2. Waiting synchronously for the lock signal and immediately dropping the
+///    guard
+///
+/// This ensures that no pointers to the dropped future remain in the queue.
+///
+/// ## Performance Notes
+///
+/// - **Fast Path**: If the mutex is unlocked, returns immediately without
+///   allocation
+/// - **Contended Path**: Allocates a wait queue if needed and registers the
+///   request
+/// - **Cancellation**: Minimal overhead when the future completes normally
+///
+/// ## Examples
+///
+/// Basic usage:
+///
+/// ```
+/// use xutex::AsyncMutex;
+/// use swait::*;
+///
+/// async fn example() {
+///     let mutex = AsyncMutex::new(42);
+///     
+///     // lock() returns an AsyncLockRequest
+///     let guard = mutex.lock().await;
+///     assert_eq!(*guard, 42);
+/// }
+///
+/// example().swait();
+/// ```
 pub struct AsyncLockRequest<'a, T> {
     mutex: &'a MutexInternal<T>,
     entry: Signal,
@@ -169,14 +270,18 @@ impl<'a, T> AsyncLockRequest<'a, T> {
                 continue;
             }
 
+            let queue_guard = unsafe { (&*ptr).acquire_guard() };
+            // Untag the queue we have guard
+            self.mutex.queue.store(ptr, Ordering::Release);
+
             // Remove ourselves from the queue
             let result = unsafe {
                 let mut queue = lock_unpoisoned(ptr);
-                queue.remove(NonNull::new_unchecked(&mut self.entry))
+                let res = queue.remove(NonNull::new_unchecked(&mut self.entry));
+                queue_guard.release(queue);
+                res
             };
 
-            // Untag the queue
-            self.mutex.queue.store(ptr, Ordering::Release);
             return result;
         }
     }
@@ -198,6 +303,7 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
             this.entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
             return Poll::Ready(unsafe { this.mutex.create_guard() });
         }
+        let queue_guard: QueueGuard<'_>;
         if sig_val == SIGNAL_INIT_WAITING {
             this.entry.waker.register(cx.waker());
             Poll::Pending
@@ -233,6 +339,9 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
                         backoff.snooze();
                         continue;
                     }
+                    queue_guard = unsafe { (&*ptr).acquire_guard() };
+                    // untag
+                    this.mutex.queue.store(ptr, Ordering::Release);
                 } else {
                     let is_tagged;
                     (ptr, is_tagged) = untag_pointer(ptr);
@@ -254,6 +363,9 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
                     if tagging_result.is_err() {
                         continue;
                     }
+                    queue_guard = unsafe { (&*ptr).acquire_guard() };
+                    // untag
+                    this.mutex.queue.store(ptr, Ordering::Release);
                 }
 
                 this.entry
@@ -263,14 +375,15 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
                 this.entry.waker.register(cx.waker());
 
                 let mut queue = unsafe { lock_unpoisoned(ptr) };
-                // untag
-                this.mutex.queue.store(ptr, Ordering::Release);
+
                 unsafe {
                     // SAFETY: We guarantee that the entry lives long enough, or is removed from the
                     // queue on drop
                     // Convert the mutable raw pointer to NonNull as required by `push`
                     queue.push(NonNull::new_unchecked(&mut this.entry));
                 }
+
+                queue_guard.release(queue);
 
                 return Poll::Pending;
             }
@@ -280,22 +393,112 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
 
 impl<'a, T> Drop for AsyncLockRequest<'a, T> {
     fn drop(&mut self) {
-        if unlikely(self.entry.value.load(Ordering::Acquire) == SIGNAL_INIT_WAITING) {
-            if !self.remove_from_queue() {
-                // we failed to remove ourself so we need to wait synchronously for the lock,
-                // this usually wouldn't take much as other one acquired our pointer and soon
-                // will be signaled. the spin is likely to never happen.
-                let backoff = Backoff::new();
-                while self.entry.value.load(Ordering::Acquire) != SIGNAL_SIGNALED {
-                    backoff.snooze();
-                }
-                // SAFETY: we have the lock now, load it and drop it.
-                drop(unsafe { self.mutex.create_guard() });
+        if unlikely(self.entry.value.load(Ordering::Acquire) == SIGNAL_INIT_WAITING)
+            && !self.remove_from_queue()
+        {
+            // we failed to remove ourself so we need to wait synchronously for the lock,
+            // this usually wouldn't take much as other one acquired our pointer and soon
+            // will be signaled. the spin is likely to never happen.
+            let backoff = Backoff::new();
+            while self.entry.value.load(Ordering::Acquire) != SIGNAL_SIGNALED {
+                backoff.snooze();
             }
+            // SAFETY: we have the lock now, load it and drop it.
+            drop(unsafe { self.mutex.create_guard() });
         };
     }
 }
 
+/// A synchronous mutex that provides exclusive access to shared data.
+///
+/// This mutex implementation is designed for high performance with minimal
+/// overhead in the uncontended case. It uses an optimistic approach where the
+/// fast path (when the mutex is unlocked) requires only a single atomic
+/// compare-and-swap operation.
+///
+/// ## Performance Characteristics
+///
+/// This lock is slightly slower than `std::sync::Mutex` in purely synchronous
+/// workloads due to additional overhead required to support async contexts.
+/// However, this library excels when used in async/await code, where it can
+/// yield to the async runtime instead of blocking threads.
+///
+/// The primary benefit is the ability to use the same lock type in both
+/// synchronous and asynchronous contexts, enabling flexible code that can
+/// seamlessly transition between blocking and non-blocking operations without
+/// changing data structures.
+///
+/// ## Memory Layout
+///
+/// The struct uses `#[repr(C)]` to ensure a stable memory layout that is
+/// identical to [`AsyncMutex<T>`]. This allows safe conversion between
+/// synchronous and asynchronous mutex types without allocation.
+///
+/// ## Contention Handling
+///
+/// When contention occurs, the mutex dynamically allocates a wait queue to
+/// manage blocked threads. The queue is automatically deallocated when
+/// contention subsides. Waiting threads use an adaptive spinning strategy
+/// before parking to minimize latency for short critical sections.
+///
+/// ## Thread Safety
+///
+/// This type is `Send + Sync` when `T: Send`. The mutex ensures that only one
+/// thread can access the protected data at any time through the [`MutexGuard`].
+///
+/// ## Conversion to Async
+///
+/// This synchronous mutex can be seamlessly converted to an [`AsyncMutex<T>`]
+/// using [`as_async()`](Self::as_async), [`to_async()`](Self::to_async), or
+/// [`lock_async()`](Self::lock_async) without any allocation overhead.
+///
+/// ## Examples
+///
+/// Basic usage:
+///
+/// ```
+/// use xutex::Mutex;
+/// use std::sync::Arc;
+/// use std::thread;
+///
+/// let mutex = Arc::new(Mutex::new(0));
+/// let handles: Vec<_> = (0..10).map(|_| {
+///     let mutex = Arc::clone(&mutex);
+///     thread::spawn(move || {
+///         let mut guard = mutex.lock();
+///         *guard += 1;
+///     })
+/// }).collect();
+///
+/// for handle in handles {
+///     handle.join().unwrap();
+/// }
+///
+/// assert_eq!(*mutex.lock(), 10);
+/// ```
+///
+/// Converting to async:
+///
+/// ```
+/// use xutex::Mutex;
+/// use swait::*;
+///
+/// async fn example() {
+///     let sync_mutex = Mutex::new(42);
+///     
+///     // Use as async without conversion
+///     let guard = sync_mutex.lock_async().await;
+///     assert_eq!(*guard, 42);
+///     drop(guard);
+///     
+///     // Convert to AsyncMutex
+///     let async_mutex = sync_mutex.to_async();
+///     let guard = async_mutex.lock().await;
+///     assert_eq!(*guard, 42);
+/// }
+///
+/// example().swait();
+/// ```
 #[repr(C)]
 pub struct Mutex<T> {
     internal: MutexInternal<T>,
@@ -335,6 +538,7 @@ impl<T> Mutex<T> {
             }
 
             let mut ptr = locking_result.unwrap_err();
+            let queue_guard: QueueGuard<'_>;
 
             if ptr == LOCKED {
                 // init queue
@@ -353,6 +557,9 @@ impl<T> Mutex<T> {
                     deallocate_queue(unsafe { Box::from_raw(ptr) });
                     continue;
                 }
+                queue_guard = unsafe { (&*ptr).acquire_guard() };
+                // untag
+                mutex.queue.store(ptr, Ordering::Release);
             } else {
                 let is_tagged;
                 (ptr, is_tagged) = untag_pointer(ptr);
@@ -375,17 +582,21 @@ impl<T> Mutex<T> {
                     backoff.snooze();
                     continue;
                 }
+
+                queue_guard = unsafe { (&*ptr).acquire_guard() };
+                // untag
+                mutex.queue.store(ptr, Ordering::Release);
             }
 
             let mut queue = unsafe { lock_unpoisoned(ptr) };
-            // untag
-            mutex.queue.store(ptr, Ordering::Release);
+
             let do_spin = unsafe {
                 // SAFETY: We guarantee that the entry lives long enough by blocking here
                 // Convert the mutable raw pointer to `NonNull<Signal>` as required by `push`.
                 queue.push(NonNull::new_unchecked(&mut entry))
             };
-            drop(queue);
+
+            queue_guard.release(queue);
 
             // if we are first in the queue, we can try to spin before parking
             if do_spin {
@@ -478,8 +689,8 @@ impl<T> Mutex<T> {
     }
     /// Converts this `Mutex<T>` into an `AsyncMutex<T>` without allocating.
     ///
-    /// Both structs are `#[repr(C)]` and have identical layout, so the transmute
-    /// is sound.
+    /// Both structs are `#[repr(C)]` and have identical layout, so the
+    /// transmute is sound.
     ///
     /// # Example
     ///
@@ -509,9 +720,10 @@ impl<T> Mutex<T> {
         AsyncMutex { internal }
     }
 
-    /// Converts an `Arc<Mutex<T>>` into an `Arc<AsyncMutex<T>>` without allocating.
+    /// Converts an `Arc<Mutex<T>>` into an `Arc<AsyncMutex<T>>` without
+    /// allocating.
     ///
-    /// The underlying pointer is re‑interpreted because the two types share the
+    /// The underlying pointer is re-interpreted because the two types share the
     /// same layout.
     ///
     /// # Example
@@ -543,6 +755,39 @@ impl<T> Mutex<T> {
         unsafe { Arc::from_raw(raw) }
     }
 
+    /// Clones an `Arc<Mutex<T>>` and returns it as an `Arc<AsyncMutex<T>>`
+    /// without allocating.
+    ///
+    /// This is a convenience method that combines `Arc::clone` with
+    /// `to_async_arc`. It's useful when you want to share the mutex with
+    /// async code while keeping the original `Arc<Mutex<T>>` for
+    /// synchronous code.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use xutex::{Mutex, AsyncMutex};
+    /// use swait::*;
+    ///
+    /// async fn example() {
+    ///     let sync_arc: Arc<Mutex<u32>> = Arc::new(Mutex::new(10));
+    ///     
+    ///     // Clone and convert to async without consuming the original
+    ///     let async_arc: Arc<AsyncMutex<u32>> = sync_arc.clone_async();
+    ///     
+    ///     // Both can be used independently
+    ///     *sync_arc.lock() = 20;
+    ///     let guard = async_arc.lock().await;
+    ///     assert_eq!(*guard, 20);
+    /// }
+    /// example().swait();
+    /// ```
+    #[inline(always)]
+    pub fn clone_async(self: &Arc<Self>) -> Arc<AsyncMutex<T>> {
+        Arc::clone(self).to_async_arc()
+    }
+
     /// Acquires the mutex asynchronously, returning a future that resolves to a
     /// guard.
     ///
@@ -572,6 +817,145 @@ impl<T> Mutex<T> {
 #[cfg(test)]
 mod tests;
 
+/// An asynchronous mutex that provides exclusive access to shared data.
+///
+/// This mutex is optimized for async/await contexts and can yield to the async
+/// runtime instead of blocking threads when contention occurs. It maintains the
+/// same high-performance characteristics as [`Mutex<T>`] while providing
+/// seamless integration with async code.
+///
+/// ## Performance Characteristics
+///
+/// `AsyncMutex` is designed for optimal performance in async environments:
+///
+/// - **Fast Path**: When uncontended, acquiring the lock requires only a single
+///   atomic compare-and-swap operation
+/// - **Async-Aware**: Uses async wakers instead of thread parking, allowing the
+///   runtime to schedule other tasks while waiting
+/// - **Zero-Cost Conversion**: Can be converted to/from [`Mutex<T>`] without
+///   allocation due to identical memory layout
+/// - **Extreme Efficiency During Contention**: Dynamically allocates a wait
+///   queue only with no additional heap overhead after contention occurs
+///
+/// ## Memory Layout
+///
+/// The struct uses `#[repr(C)]` to ensure a stable memory layout that is
+/// identical to [`Mutex<T>`]. This enables safe zero-cost conversions between
+/// synchronous and asynchronous mutex types.
+///
+/// ## Contention Handling
+///
+/// When multiple tasks attempt to acquire the lock simultaneously:
+///
+/// 1. The first task to encounter contention allocates a wait queue
+/// 2. Subsequent tasks register themselves in the queue with their async wakers
+/// 3. When the lock is released, the next waiting task is awakened via its
+///    waker
+/// 4. The queue is automatically deallocated when contention subsides
+///
+/// ## Thread Safety
+///
+/// This type is `Send + Sync` when `T: Send`. The mutex ensures that only one
+/// task can access the protected data at any time through the [`MutexGuard`].
+///
+/// ## Cancellation Safety
+///
+/// Lock acquisition futures returned by [`lock()`](Self::lock) are
+/// cancellation-safe. If a future is dropped while waiting, it will either:
+///
+/// 1. Successfully remove itself from the wait queue, or
+/// 2. Wait synchronously for the lock signal and immediately drop the guard
+///
+/// This ensures no dangling pointers remain in the queue after cancellation.
+///
+/// ## Conversion to Sync
+///
+/// This async mutex can be seamlessly converted to a [`Mutex<T>`] using
+/// [`as_sync()`](Self::as_sync), [`to_sync()`](Self::to_sync), or
+/// [`lock_sync()`](Self::lock_sync) without any allocation overhead.
+///
+/// ## Examples
+///
+/// Basic usage:
+///
+/// ```
+/// use xutex::AsyncMutex;
+/// use swait::*;
+///
+/// async fn example() {
+///     let mutex = AsyncMutex::new(0);
+///     
+///     {
+///         let mut guard = mutex.lock().await;
+///         *guard += 1;
+///     }
+///     
+///     assert_eq!(*mutex.lock().await, 1);
+/// }
+///
+/// example().swait();
+/// ```
+///
+/// Sharing between tasks:
+///
+/// ```
+/// use xutex::AsyncMutex;
+/// use std::sync::Arc;
+/// use swait::*;
+///
+/// async fn example() {
+///     let mutex = Arc::new(AsyncMutex::new(0));
+///     let mut handles = Vec::new();
+///
+///     for _ in 0..10 {
+///         let mutex = Arc::clone(&mutex);
+///         handles.push(async move {
+///             let mut guard = mutex.lock().await;
+///             *guard += 1;
+///         });
+///     }
+///
+///     for handle in handles {
+///         handle.await;
+///     }
+///
+///     assert_eq!(*mutex.lock().await, 10);
+/// }
+///
+/// example().swait();
+/// ```
+///
+/// Converting to synchronous mutex:
+///
+/// ```
+/// use xutex::AsyncMutex;
+/// use swait::*;
+///
+/// async fn example() {
+///     let async_mutex = AsyncMutex::new(42);
+///     
+///     // Use sync method on async mutex
+///     let guard = async_mutex.lock_sync();
+///     assert_eq!(*guard, 42);
+///     drop(guard);
+///     
+///     // Convert to sync mutex
+///     let sync_mutex = async_mutex.to_sync();
+///     let guard = sync_mutex.lock();
+///     assert_eq!(*guard, 42);
+/// }
+///
+/// example().swait();
+/// ```
+///
+/// ## Performance Notes
+///
+/// - **Async Contexts**: Significantly faster than blocking mutexes in async
+///   code since it doesn't block threads
+/// - **Sync Contexts**: Slight overhead compared to `std::sync::Mutex` due to
+///   async infrastructure, but the difference is minimal
+/// - **Hybrid Usage**: Ideal for libraries that need to work in both sync and
+///   async contexts without maintaining separate data structures
 #[repr(C)]
 pub struct AsyncMutex<T> {
     internal: MutexInternal<T>,
@@ -626,6 +1010,106 @@ impl<T> AsyncMutex<T> {
         unsafe { &*(self as *const AsyncMutex<T> as *const Mutex<T>) }
     }
 
+    /// Converts this `AsyncMutex<T>` into a `Mutex<T>` without allocating.W
+    ///
+    /// Both structs are `#[repr(C)]` and have identical layout, so the
+    /// conversion is sound.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use xutex::{Mutex, AsyncMutex};
+    ///
+    /// fn example() {
+    ///     // Create an asynchronous mutex.
+    ///     let async_mutex = AsyncMutex::new(10);
+    ///
+    ///     // Convert it into a synchronous mutex without any allocation.
+    ///     let sync_mutex: Mutex<i32> = async_mutex.to_sync();
+    ///
+    ///     // The data is still accessible via the sync mutex.
+    ///     let guard = sync_mutex.lock();
+    ///     assert_eq!(*guard, 10);
+    /// }
+    /// example();
+    /// ```
+    #[inline(always)]
+    pub fn to_sync(self: AsyncMutex<T>) -> Mutex<T> {
+        // Decompose the `AsyncMutex<T>` and reassemble a `Mutex<T>`.
+        // Both structs contain the same `internal` field, so this conversion
+        // is safe and does not require `transmute`.
+        let AsyncMutex { internal } = self;
+        Mutex { internal }
+    }
+
+    /// Converts an `Arc<AsyncMutex<T>>` into an `Arc<Mutex<T>>` without
+    /// allocating.
+    ///
+    /// The underlying pointer is re‑interpreted because the two types share the
+    /// same layout.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use xutex::{Mutex, AsyncMutex};
+    ///
+    /// fn example() {
+    ///     // Wrap an asynchronous mutex in an `Arc`.
+    ///     let async_arc: Arc<AsyncMutex<u32>> = Arc::new(AsyncMutex::new(10));
+    ///
+    ///     // Convert the `Arc<AsyncMutex<_>>` into an `Arc<Mutex<_>>` without allocation.
+    ///     let sync_arc: Arc<Mutex<u32>> = async_arc.clone().to_sync_arc();
+    ///
+    ///     // The data is still accessible via the sync mutex.
+    ///     let guard = sync_arc.lock();
+    ///     assert_eq!(*guard, 10);
+    /// }
+    /// example();
+    /// ```
+    #[inline(always)]
+    pub fn to_sync_arc(self: Arc<Self>) -> Arc<Mutex<T>> {
+        // Turn the Arc into a raw pointer, cast it, then rebuild an Arc.
+        let raw = Arc::into_raw(self) as *const Mutex<T>;
+        // SAFETY: the raw pointer points to a valid `Mutex<T>` because the
+        // layout of `AsyncMutex<T>` and `Mutex<T>` is identical.
+        unsafe { Arc::from_raw(raw) }
+    }
+
+    /// Clones an `Arc<AsyncMutex<T>>` and returns it as an `Arc<Mutex<T>>`
+    /// without allocating.
+    ///
+    /// This is a convenience method that combines `Arc::clone` with
+    /// `to_sync_arc`. It's useful when you want to share the mutex with
+    /// sync code while keeping the original `Arc<AsyncMutex<T>>` for
+    /// asynchronous code.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use xutex::{Mutex, AsyncMutex};
+    /// use swait::*;
+    ///
+    /// async fn example() {
+    ///     let async_arc: Arc<AsyncMutex<u32>> = Arc::new(AsyncMutex::new(10));
+    ///     
+    ///     // Clone and convert to sync without consuming the original
+    ///     let sync_arc: Arc<Mutex<u32>> = async_arc.clone_sync();
+    ///     
+    ///     // Both can be used independently
+    ///     *sync_arc.lock() = 20;
+    ///     let guard = async_arc.lock().await;
+    ///     assert_eq!(*guard, 20);
+    /// }
+    /// example().swait();
+    /// ```
+    #[inline(always)]
+    pub fn clone_sync(self: &Arc<Self>) -> Arc<Mutex<T>> {
+        Arc::clone(self).to_sync_arc()
+    }
+
     /// Acquires the lock synchronously, blocking the current thread.
     ///
     /// Internally it converts `self` to a `&Mutex<T>` via `as_sync` and then
@@ -636,6 +1120,32 @@ impl<T> AsyncMutex<T> {
     }
 }
 
+/// A guard that provides exclusive access to the data protected by a mutex.
+///
+/// This type is returned by [`Mutex::lock()`], [`Mutex::try_lock()`],
+/// [`AsyncMutex::lock()`], [`AsyncMutex::try_lock()`], and
+/// [`AsyncMutex::lock_sync()`]. It implements [`Deref`] and [`DerefMut`] to
+/// provide access to the underlying data.
+///
+/// The guard automatically releases the mutex when it is dropped, ensuring that
+/// the lock cannot be forgotten or left in an inconsistent state.
+///
+/// ## Thread Safety
+///
+/// `MutexGuard` is `Send` when `T: Send`, allowing it to be transferred between
+/// threads. It is `Sync` when `T: Sync`, allowing shared references to be used
+/// across threads (though this is rarely useful since the guard provides
+/// exclusive access).
+///
+/// ## Drop Behavior
+///
+/// When the guard is dropped, it:
+/// 1. Attempts to unlock the mutex using a fast path (single atomic operation)
+/// 2. If contention exists, it signals the next waiting thread or task
+/// 3. Potentially deallocates the wait queue if no more waiters exist
+///
+/// The drop implementation is carefully optimized to minimize overhead in the
+/// common case where no other threads are waiting.
 #[repr(C)]
 pub struct MutexGuard<'a, T> {
     mutex: &'a MutexInternal<T>,
@@ -658,6 +1168,8 @@ impl<'a, T> MutexGuard<'a, T> {
             }
             let ptr = unlock_result.unwrap_err();
             let (ptr, is_tagged) = untag_pointer(ptr);
+            // only single writer so we will not check if pointer is going to get free
+            // as we are the only one who can write into it.
             let mut queue = unsafe { lock_unpoisoned(&*ptr) };
             if let Some(entry) = queue.pop() {
                 drop(queue);
@@ -703,7 +1215,9 @@ impl<'a, T> MutexGuard<'a, T> {
                     backoff.snooze();
                     continue;
                 }
-                if queue.is_empty() {
+                let counter = unsafe { &*ptr }.read_counter();
+                // nothing is in the queue and no one is pushing into it
+                if counter == 0 && queue.is_empty() {
                     // queue is untouched it is possible to release the queue and unlock
                     self.mutex.queue.store(UNLOCKED, Ordering::Release);
                     // SAFETY: this section is sole owner of the queue and queue is_empty
