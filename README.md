@@ -8,7 +8,7 @@
 
 ## Key Features
 
-- **⚡ Blazing-fast async performance**: Up to 50× faster than standard sync mutexes in single-threaded async runtimes, and 3–5× faster in multi-threaded async runtime.
+- **⚡ Blazing-fast async performance**: Up to 50× faster than standard sync mutexes in single-threaded async runtimes, and 3–5× faster in multi-threaded async runtime under extreme contention.
 - **🔄 Hybrid API**: Use the same lock in both sync and async contexts
 - **⚡ 8-byte lock state**: Single `AtomicPtr` on 64-bit platforms (guarded data stored separately)
 - **🚀 Zero-allocation fast path**: Lock acquisition requires no heap allocation when uncontended
@@ -90,6 +90,7 @@ fn example(){
 
    - `UNLOCKED` (null): Lock is free
    - `LOCKED` (sentinel): Lock held, no waiters
+   - `UPDATING`: Queue initialization in progress
    - `QUEUE_PTR`: Lock held with waiting tasks/threads
 
 2. **Lock-free fast path**: Uncontended acquisition uses a single `compare_exchange`
@@ -117,8 +118,8 @@ cargo bench
 **Expected Performance** (varies by hardware):
 
 - **Uncontended**: ~1-3ns per lock/unlock cycle (single CAS operation)
-- **High contention**: 2-5× faster than `tokio::sync::Mutex` in async contexts
-- **Sync contexts**: Comparable to `std::sync::Mutex`, slight overhead due to queue pointer check overhead.
+- **High contention**: 2-3× faster than `tokio::sync::Mutex` in async contexts
+- **Sync contexts**: Performance comparable to `std::sync::Mutex` with minimal overhead from queue pointer checks under high contention; matches `parking_lot` performance in low-contention scenarios
 
 ## Design Deep Dive
 
@@ -241,6 +242,7 @@ cargo bench
 ## TODO
 
 - [ ] Implement `RwLock` variant with shared/exclusive locking
+- [ ] Explore lock-free linked list implementation for improved wait queue performance
 
 ## Contributing
 
