@@ -118,6 +118,7 @@ impl QueueGuard<'_> {
 
 const LOCKED: *mut QueueStructure = usize::MAX as *mut _;
 const UNLOCKED: *mut QueueStructure = std::ptr::null_mut();
+const UPDATING: *mut QueueStructure = LOCKED.wrapping_sub(1);
 
 #[inline(always)]
 fn tag_pointer<T>(ptr: *mut T) -> *mut T {
@@ -261,7 +262,7 @@ impl<'a, T> AsyncLockRequest<'a, T> {
             let tagging_result = self.mutex.queue.compare_exchange(
                 ptr,
                 tagged_ptr,
-                Ordering::AcqRel,
+                Ordering::Acquire,
                 Ordering::Relaxed,
             );
 
@@ -313,8 +314,8 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
                 let locking_result = this.mutex.queue.compare_exchange(
                     UNLOCKED,
                     LOCKED,
-                    Ordering::AcqRel,
                     Ordering::Acquire,
+                    Ordering::Relaxed,
                 );
                 if likely(locking_result.is_ok()) {
                     return Poll::Ready(unsafe { this.mutex.create_guard() });
@@ -322,25 +323,27 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
 
                 let mut ptr = locking_result.unwrap_err();
 
+                if ptr == UPDATING {
+                    backoff.snooze();
+                    continue;
+                }
+
                 if ptr == LOCKED {
                     // init queue
-                    ptr = Box::leak(allocate_queue());
-                    let tagged_ptr = tag_pointer(ptr);
-                    let q_init_result = this.mutex.queue.compare_exchange(
+                    let updating_token_init_result = this.mutex.queue.compare_exchange(
                         LOCKED,
-                        tagged_ptr,
-                        Ordering::AcqRel,
+                        UPDATING,
+                        Ordering::Acquire,
                         Ordering::Relaxed,
                     );
-                    // deallocate if failed
-                    if unlikely(q_init_result.is_err()) {
-                        // SAFETY: ptr is valid as it was just allocated
-                        deallocate_queue(unsafe { Box::from_raw(ptr) });
+
+                    if unlikely(updating_token_init_result.is_err()) {
                         backoff.snooze();
                         continue;
                     }
+
+                    ptr = Box::leak(allocate_queue());
                     queue_guard = unsafe { (&*ptr).acquire_guard() };
-                    // untag
                     this.mutex.queue.store(ptr, Ordering::Release);
                 } else {
                     let is_tagged;
@@ -356,7 +359,7 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
                     let tagging_result = this.mutex.queue.compare_exchange(
                         ptr,
                         tagged_ptr,
-                        Ordering::AcqRel,
+                        Ordering::Acquire,
                         Ordering::Relaxed,
                     );
 
@@ -528,10 +531,12 @@ impl<T> Mutex<T> {
         let mutex = &self.internal;
         let backoff = Backoff::new();
         loop {
-            let locking_result =
-                mutex
-                    .queue
-                    .compare_exchange(UNLOCKED, LOCKED, Ordering::AcqRel, Ordering::Acquire);
+            let locking_result = mutex.queue.compare_exchange(
+                UNLOCKED,
+                LOCKED,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            );
 
             if likely(locking_result.is_ok()) {
                 return;
@@ -548,7 +553,7 @@ impl<T> Mutex<T> {
                 let q_init_result = mutex.queue.compare_exchange(
                     LOCKED,
                     tagged_ptr,
-                    Ordering::AcqRel,
+                    Ordering::Acquire,
                     Ordering::Relaxed,
                 );
                 // deallocate if failed
@@ -574,7 +579,7 @@ impl<T> Mutex<T> {
                 let tagging_result = mutex.queue.compare_exchange(
                     ptr,
                     tagged_ptr,
-                    Ordering::AcqRel,
+                    Ordering::Acquire,
                     Ordering::Relaxed,
                 );
 
@@ -1168,13 +1173,17 @@ impl<'a, T> MutexGuard<'a, T> {
             let unlock_result = self.mutex.queue.compare_exchange(
                 LOCKED,
                 UNLOCKED,
-                Ordering::AcqRel,
+                Ordering::Release,
                 Ordering::Acquire,
             );
             if likely(unlock_result.is_ok()) {
                 return;
             }
             let ptr = unlock_result.unwrap_err();
+            if ptr == UPDATING {
+                backoff.snooze();
+                continue;
+            }
             let (ptr, is_tagged) = untag_pointer(ptr);
             // only single writer so we will not check if pointer is going to get free
             // as we are the only one who can write into it.
@@ -1215,7 +1224,7 @@ impl<'a, T> MutexGuard<'a, T> {
                 let tagging_result = self.mutex.queue.compare_exchange(
                     ptr,
                     tagged_ptr,
-                    Ordering::AcqRel,
+                    Ordering::Acquire,
                     Ordering::Relaxed,
                 );
                 // wait for waker to be available in the queue
@@ -1259,7 +1268,7 @@ impl<T> Drop for MutexGuard<'_, T> {
         let unlock_result = self.mutex.queue.compare_exchange(
             LOCKED,
             UNLOCKED,
-            Ordering::AcqRel,
+            Ordering::Release,
             Ordering::Relaxed,
         );
         if likely(unlock_result.is_ok()) {
