@@ -42,6 +42,32 @@ fn benchmark_xutex_uncontended(c: &mut Criterion) {
     });
 }
 
+fn benchmark_tokionative_uncontended(c: &mut Criterion) {
+    c.bench_function("tokionative_uncontended", |b| {
+        let mutex = tokio::sync::Mutex::new(0);
+        b.iter(|| {
+            swait::swait(async {
+                let mut guard = mutex.lock().await;
+                *guard += 1;
+                black_box(*guard);
+            });
+        });
+    });
+}
+
+fn benchmark_xutex_uncontended_async(c: &mut Criterion) {
+    c.bench_function("xutex_uncontended_async", |b| {
+        let mutex = AsyncMutex::new(0);
+        b.iter(|| {
+            swait::swait(async {
+                let mut guard = mutex.lock().await;
+                *guard += 1;
+                black_box(*guard);
+            });
+        });
+    });
+}
+
 fn benchmark_std_mutex_contended(c: &mut Criterion) {
     c.bench_function("std_mutex_contended", |b| {
         let mutex = Arc::new(StdMutex::new(0));
@@ -296,6 +322,8 @@ criterion_group!(
     benchmark_std_mutex_uncontended,
     benchmark_parkinglot_mutex_uncontended,
     benchmark_xutex_uncontended,
+    benchmark_tokionative_uncontended,
+    benchmark_xutex_uncontended_async,
     benchmark_std_mutex_contended,
     benchmark_parkinglot_mutex_contended,
     benchmark_xutex_contended,
