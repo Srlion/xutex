@@ -248,11 +248,12 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
             this.entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
             return Poll::Ready(unsafe { this.mutex.create_guard() });
         }
-        if sig_val == SIGNAL_INIT_WAITING {
+        if unlikely(sig_val == SIGNAL_INIT_WAITING) {
             this.entry.waker.register(cx.waker());
             Poll::Pending
         } else {
             let backoff = Backoff::new();
+            let mut need_initialization = true;
             loop {
                 let locking_result = this.mutex.queue.compare_exchange(
                     UNLOCKED,
@@ -260,13 +261,23 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
                     Ordering::Acquire,
                     Ordering::Relaxed,
                 );
+
                 if likely(locking_result.is_ok()) {
+                    this.entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
                     return Poll::Ready(unsafe { this.mutex.create_guard() });
+                }
+
+                if need_initialization {
+                    this.entry
+                        .value
+                        .store(SIGNAL_INIT_WAITING, Ordering::Release);
+                    this.entry.waker.register(cx.waker());
+                    need_initialization = false;
                 }
 
                 let mut ptr = locking_result.unwrap_err();
 
-                if ptr == UPDATING {
+                if unlikely(ptr == UPDATING) {
                     backoff.snooze();
                     continue;
                 }
@@ -290,7 +301,7 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
                     let is_tagged;
                     (ptr, is_tagged) = untag_pointer(ptr);
 
-                    if is_tagged {
+                    if unlikely(is_tagged) {
                         backoff.snooze();
                         continue;
                     }
@@ -304,16 +315,10 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
                         Ordering::Relaxed,
                     );
 
-                    if tagging_result.is_err() {
+                    if unlikely(tagging_result.is_err()) {
                         continue;
                     }
                 }
-
-                this.entry
-                    .value
-                    .store(SIGNAL_INIT_WAITING, Ordering::Release);
-
-                this.entry.waker.register(cx.waker());
 
                 let queue = unsafe {
                     // SAFETY: ptr is tagged and we have exclusive access
@@ -485,7 +490,7 @@ impl<T> Mutex<T> {
 
             let mut ptr = locking_result.unwrap_err();
 
-            if ptr == UPDATING {
+            if unlikely(ptr == UPDATING) {
                 backoff.snooze();
                 continue;
             }
@@ -509,7 +514,7 @@ impl<T> Mutex<T> {
                 let is_tagged;
                 (ptr, is_tagged) = untag_pointer(ptr);
 
-                if is_tagged {
+                if unlikely(is_tagged) {
                     backoff.snooze();
                     continue;
                 }
@@ -523,7 +528,7 @@ impl<T> Mutex<T> {
                     Ordering::Relaxed,
                 );
 
-                if tagging_result.is_err() {
+                if unlikely(tagging_result.is_err()) {
                     backoff.snooze();
                     continue;
                 }
@@ -552,7 +557,7 @@ impl<T> Mutex<T> {
                     backoff.snooze();
                 }
             }
-            if entry.value.swap(SIGNAL_INIT_WAITING, Ordering::AcqRel) == SIGNAL_SIGNALED {
+            if likely(entry.value.swap(SIGNAL_INIT_WAITING, Ordering::AcqRel) == SIGNAL_SIGNALED) {
                 return;
             }
             loop {
