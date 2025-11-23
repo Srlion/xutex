@@ -172,6 +172,7 @@ impl<T> MutexInternal<T> {
 ///
 /// example().swait();
 /// ```
+#[must_use = "futures do nothing unless polled"]
 pub struct AsyncLockRequest<'a, T> {
     mutex: &'a MutexInternal<T>,
     entry: Signal,
