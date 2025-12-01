@@ -50,6 +50,16 @@ jobs:
         run: cargo build --release --verbose
       - name: Test with Cargo (Release)
         run: cargo test --release --verbose
+  cargo_test_no_default_features:
+    name: "Cargo Test (No Default Features)"
+    runs-on: ubuntu-latest
+    needs: [cargo_test_release]
+    steps:
+      - uses: actions/checkout@v3
+      - name: Build
+        run: cargo build --no-default-features --verbose
+      - name: Test with Cargo (No Default Features)
+        run: cargo test --no-default-features --verbose
   miri_test:
     name: "Miri Test"
     runs-on: ubuntu-latest
