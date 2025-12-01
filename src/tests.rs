@@ -78,7 +78,7 @@ fn test_tokio_multicoroutine() {
         .enable_all()
         .build()
         .unwrap();
-    let mutex = Arc::new(Mutex::new(0));
+    let mutex = Arc::new(AsyncMutex::new(0));
 
     rt.block_on(async {
         let mut handles = vec![];
@@ -86,7 +86,7 @@ fn test_tokio_multicoroutine() {
             let mutex_clone = Arc::clone(&mutex);
             let handle = tokio::spawn(async move {
                 for _ in 0..INCREMENTS_PER_THREAD {
-                    let mut guard = mutex_clone.lock();
+                    let mut guard = mutex_clone.lock().await;
                     *guard += 1;
                 }
             });
@@ -98,7 +98,9 @@ fn test_tokio_multicoroutine() {
         }
     });
 
-    assert_eq!(*mutex.lock(), THREAD_COUNT * INCREMENTS_PER_THREAD);
+    rt.block_on(async {
+        assert_eq!(*mutex.lock().await, THREAD_COUNT * INCREMENTS_PER_THREAD);
+    });
 }
 
 #[test]

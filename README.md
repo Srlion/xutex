@@ -16,6 +16,7 @@
 - **🎯 Runtime-agnostic**: Works with Tokio, async-std, monoio, or any executor using `std::task::Waker`
 - **🔒 Lock-free fast path**: Single CAS operation for uncontended acquisition
 - **📦 Minimal footprint**: Compact state representation with lazy queue allocation
+- **🛡️ No-std compatible**: Fully compatible with `no_std` environments, relying only on `core` and `alloc`
 
 ## Installation
 
@@ -35,14 +36,17 @@ cargo add xutex
 ### Synchronous Usage
 
 ```rust
-use xutex::Mutex;
+#[cfg(feature = "std")]
+fn example() {
+  use xutex::Mutex;
 
-let mutex = Mutex::new(0);
-{
+  let mutex = Mutex::new(0);
+  {
     let mut guard = mutex.lock();
     *guard += 1;
-} // automatically unlocked on drop
-assert_eq!(*mutex.lock(), 1);
+  } // automatically unlocked on drop
+  assert_eq!(*mutex.lock(), 1);
+}
 ```
 
 ### Asynchronous Usage
@@ -61,17 +65,19 @@ async fn increment(mutex: &AsyncMutex<i32>) {
 Convert seamlessly between sync and async:
 
 ```rust
-use xutex::{Mutex, AsyncMutex};
-
+#[cfg(feature = "std")]
+use xutex::Mutex;
+#[cfg(feature = "std")]
 async fn example(mutex: &Mutex<i32>) {
-  let async_ref: &AsyncMutex<_> = mutex.as_async();
+  let async_ref = mutex.as_async();
   let guard = async_ref.lock().await;
 }
 ```
 
 ```rust
-use xutex::{Mutex, AsyncMutex};
+#[cfg(feature = "std")]
 fn example(){
+  use xutex::{Mutex, AsyncMutex};
   // Async → Sync
   let async_mutex = AsyncMutex::new(5);
   let sync_ref: &Mutex<_> = async_mutex.as_sync();
@@ -252,6 +258,7 @@ Contributions are welcome! Please:
 2. Add tests for new functionality
 3. Update documentation as needed
 4. Verify `cargo miri test` passes
+5. Note: This library is `no-std` compatible; use `core` and `alloc` instead of `std`. Ensure `cargo test` and `cargo test --no-default-features` run without warnings.
 
 ## License
 

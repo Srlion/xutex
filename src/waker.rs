@@ -1,4 +1,7 @@
-use std::{cell::UnsafeCell, sync::atomic::AtomicBool, task::Waker, thread};
+use core::{cell::UnsafeCell, sync::atomic::AtomicBool, task::Waker};
+
+#[cfg(feature = "std")]
+use std::thread;
 
 use crate::backoff::Backoff;
 
@@ -7,6 +10,7 @@ pub(crate) enum WakerSlot {
     None,
     /// Holds a synchronous thread handle for contexts that wake a thread
     /// directly.
+    #[cfg(feature = "std")]
     Sync(thread::Thread),
     /// Holds an asynchronous `Waker` for futures/tasks.
     Async(Waker),
@@ -41,6 +45,7 @@ impl DynamicWaker {
     /// This variant is used for synchronous contexts where the waker should be
     /// a `thread::Thread` rather than an async `Waker`. The `updating` flag is
     /// also cleared initially.
+    #[cfg(feature = "std")]
     pub(crate) fn new_sync() -> Self {
         Self {
             updating: AtomicBool::new(false),
@@ -65,7 +70,7 @@ impl DynamicWaker {
         let backoff = Backoff::new();
         while self
             .updating
-            .swap(true, std::sync::atomic::Ordering::Acquire)
+            .swap(true, core::sync::atomic::Ordering::Acquire)
         {
             backoff.snooze();
         }
@@ -86,7 +91,7 @@ impl DynamicWaker {
 
         // Release the lock.
         self.updating
-            .store(false, std::sync::atomic::Ordering::Release);
+            .store(false, core::sync::atomic::Ordering::Release);
     }
 
     /// Take the current `WakerSlot` out of the container, leaving `None`
@@ -100,17 +105,17 @@ impl DynamicWaker {
         let backoff = Backoff::new();
         while self
             .updating
-            .swap(true, std::sync::atomic::Ordering::Acquire)
+            .swap(true, core::sync::atomic::Ordering::Acquire)
         {
             backoff.snooze();
         }
 
         // SAFETY: We hold the lock, so it's safe to replace the inner value.
-        let value = unsafe { std::mem::replace(&mut *self.value.get(), WakerSlot::None) };
+        let value = unsafe { core::mem::replace(&mut *self.value.get(), WakerSlot::None) };
 
         // Release the lock.
         self.updating
-            .store(false, std::sync::atomic::Ordering::Release);
+            .store(false, core::sync::atomic::Ordering::Release);
         value
     }
 }

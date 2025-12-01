@@ -1,7 +1,13 @@
+#![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
 #![doc = include_str!("../README.md")]
-use std::ptr::NonNull;
-use std::{
+
+extern crate alloc;
+use alloc::boxed::Box;
+#[cfg(feature = "std")]
+use alloc::sync::Arc;
+use core::ptr::NonNull;
+use core::{
     cell::UnsafeCell,
     marker::PhantomPinned,
     ops::{Deref, DerefMut},
@@ -21,7 +27,6 @@ use crate::{
 };
 use backoff::Backoff;
 use branches::{likely, unlikely};
-use std::sync::Arc;
 
 #[repr(C)]
 pub(crate) struct Signal {
@@ -40,6 +45,7 @@ impl Signal {
             _pinned: PhantomPinned,
         }
     }
+    #[cfg(feature = "std")]
     pub fn new_sync() -> Self {
         Self {
             next: None,
@@ -63,7 +69,7 @@ impl QueueStructure {
 }
 
 const LOCKED: *mut QueueStructure = usize::MAX as *mut _;
-const UNLOCKED: *mut QueueStructure = std::ptr::null_mut();
+const UNLOCKED: *mut QueueStructure = core::ptr::null_mut();
 const UPDATING: *mut QueueStructure = LOCKED.wrapping_sub(1);
 
 #[inline(always)]
@@ -236,7 +242,10 @@ impl<'a, T> AsyncLockRequest<'a, T> {
 impl<'a, T> Future for AsyncLockRequest<'a, T> {
     type Output = MutexGuard<'a, T>;
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
         let sig_val = this.entry.value.load(Ordering::Acquire);
         if likely(sig_val >= SIGNAL_SIGNALED) {
@@ -449,11 +458,13 @@ impl<'a, T> Drop for AsyncLockRequest<'a, T> {
 ///
 /// example().swait();
 /// ```
+#[cfg(feature = "std")]
 #[repr(C)]
 pub struct Mutex<T> {
     internal: MutexInternal<T>,
 }
 
+#[cfg(feature = "std")]
 impl<T> Mutex<T> {
     /// Creates a new synchronous mutex.
     ///
@@ -773,6 +784,7 @@ impl<T> Mutex<T> {
 }
 
 #[cfg(test)]
+#[cfg(feature = "std")]
 mod tests;
 
 /// An asynchronous mutex that provides exclusive access to shared data.
@@ -888,7 +900,7 @@ mod tests;
 /// ```
 /// use xutex::AsyncMutex;
 /// use swait::*;
-///
+/// #[cfg(feature = "std")]
 /// async fn example() {
 ///     let async_mutex = AsyncMutex::new(42);
 ///     
@@ -902,7 +914,7 @@ mod tests;
 ///     let guard = sync_mutex.lock();
 ///     assert_eq!(*guard, 42);
 /// }
-///
+/// #[cfg(feature = "std")]
 /// example().swait();
 /// ```
 ///
@@ -963,6 +975,7 @@ impl<T> AsyncMutex<T> {
     /// `unsafe` conversion is sound. It enables the async mutex to reuse
     /// the synchronous lock implementation when needed (e.g., `lock_sync`).
     #[inline(always)]
+    #[cfg(feature = "std")]
     pub fn as_sync(&self) -> &Mutex<T> {
         // SAFETY: same memory layout and structure
         unsafe { &*(self as *const AsyncMutex<T> as *const Mutex<T>) }
@@ -993,6 +1006,7 @@ impl<T> AsyncMutex<T> {
     /// example();
     /// ```
     #[inline(always)]
+    #[cfg(feature = "std")]
     pub fn to_sync(self: AsyncMutex<T>) -> Mutex<T> {
         // Decompose the `AsyncMutex<T>` and reassemble a `Mutex<T>`.
         // Both structs contain the same `internal` field, so this conversion
@@ -1027,6 +1041,7 @@ impl<T> AsyncMutex<T> {
     /// example();
     /// ```
     #[inline(always)]
+    #[cfg(feature = "std")]
     pub fn to_sync_arc(self: Arc<Self>) -> Arc<Mutex<T>> {
         // Turn the Arc into a raw pointer, cast it, then rebuild an Arc.
         let raw = Arc::into_raw(self) as *const Mutex<T>;
@@ -1064,6 +1079,7 @@ impl<T> AsyncMutex<T> {
     /// example().swait();
     /// ```
     #[inline(always)]
+    #[cfg(feature = "std")]
     pub fn clone_sync(self: &Arc<Self>) -> Arc<Mutex<T>> {
         Arc::clone(self).to_sync_arc()
     }
@@ -1073,6 +1089,7 @@ impl<T> AsyncMutex<T> {
     /// Internally it converts `self` to a `&Mutex<T>` via `as_sync` and then
     /// calls the regular `Mutex::lock` method.
     #[inline(always)]
+    #[cfg(feature = "std")]
     pub fn lock_sync(&self) -> MutexGuard<'_, T> {
         self.as_sync().lock()
     }
@@ -1166,6 +1183,7 @@ impl<'a, T> MutexGuard<'a, T> {
 
                 match waker {
                     WakerSlot::None => {}
+                    #[cfg(feature = "std")]
                     WakerSlot::Sync(thread) => {
                         if entry_ref.value.swap(SIGNAL_SIGNALED, Ordering::AcqRel)
                             == SIGNAL_INIT_WAITING
@@ -1225,7 +1243,9 @@ impl<T> DerefMut for MutexGuard<'_, T> {
 
 unsafe impl<T: Send> Send for MutexInternal<T> {}
 unsafe impl<T: Send> Sync for MutexInternal<T> {}
+#[cfg(feature = "std")]
 unsafe impl<T: Send> Send for Mutex<T> {}
+#[cfg(feature = "std")]
 unsafe impl<T: Send> Sync for Mutex<T> {}
 unsafe impl<T: Send> Send for AsyncMutex<T> {}
 unsafe impl<T: Send> Sync for AsyncMutex<T> {}

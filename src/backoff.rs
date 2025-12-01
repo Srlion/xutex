@@ -1,8 +1,8 @@
-use std::{
-    cell::Cell,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use core::cell::Cell;
+#[cfg(feature = "std")]
+use core::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(feature = "std")]
 use branches::likely;
 
 /// Backoff implements an exponential back‑off strategy used by
@@ -39,9 +39,30 @@ use branches::likely;
 ///   alternative action.
 pub(crate) struct Backoff {
     spin: Cell<u32>,
+    #[cfg(feature = "std")]
     snooze_fn: fn(&Self),
 }
 
+#[cfg(not(feature = "std"))]
+impl Backoff {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self { spin: Cell::new(0) }
+    }
+
+    #[inline(always)]
+    pub fn snooze(&self) {
+        // In no-std environments, we cannot yield the thread, so we just
+        // perform a spin loop.
+        let spin: u32 = self.spin.get();
+        for _ in 0..(1 << spin.min(5)) {
+            core::hint::spin_loop();
+        }
+        self.spin.set(spin + 1);
+    }
+}
+
+#[cfg(feature = "std")]
 impl Backoff {
     #[inline(always)]
     pub fn new() -> Self {
@@ -98,6 +119,7 @@ impl Backoff {
 /// hot paths (e.g. spin‑backoff) where the overhead of a function call would
 /// be noticeable.
 #[inline(always)]
+#[cfg(feature = "std")]
 pub fn get_parallelism() -> usize {
     static PARALLELISM: AtomicUsize = AtomicUsize::new(0);
 
