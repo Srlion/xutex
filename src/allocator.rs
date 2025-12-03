@@ -1,11 +1,12 @@
 use crate::QueueStructure;
 use alloc::boxed::Box;
 use crossbeam_queue::ArrayQueue;
+
 #[cfg(feature = "std")]
 use std::sync::OnceLock;
 
 #[cfg(not(feature = "std"))]
-use once_cell::sync::OnceCell as OnceLock;
+use crate::oncelock::OnceLock;
 
 const QUEUE_POOL_CAPACITY: usize = 128;
 

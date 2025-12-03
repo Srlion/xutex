@@ -17,6 +17,8 @@ use core::{
 
 mod allocator;
 mod backoff;
+#[cfg(not(feature = "std"))]
+mod oncelock;
 mod signal_queue;
 mod waker;
 pub(crate) use signal_queue::SignalQueue;
