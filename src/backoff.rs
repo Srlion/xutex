@@ -135,3 +135,8 @@ pub fn get_parallelism() -> usize {
     PARALLELISM.store(parallelism, Ordering::Release);
     parallelism
 }
+
+#[cfg(not(feature = "std"))]
+pub fn get_parallelism() -> usize {
+    1
+}
