@@ -22,13 +22,16 @@
 
 ```toml
 [dependencies]
-xutex = "0.1"
+xutex = "0.2"
 ```
 
 Or via cargo:
 
 ```sh
+# with std
 cargo add xutex
+# for no-std environments
+cargo add xutex --no-default-features
 ```
 
 ## Quick Start
