@@ -797,6 +797,12 @@ impl<T> Mutex<T> {
 
     #[cfg(feature = "reentrant")]
     #[inline(always)]
+    unsafe fn force_unlock(&self) {
+        drop(unsafe { self.internal.create_guard() });
+    }
+
+    #[cfg(feature = "reentrant")]
+    #[inline(always)]
     pub(crate) fn has_waiters(&self) -> bool {
         self.internal.has_waiters()
     }
