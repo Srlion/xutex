@@ -125,6 +125,13 @@ impl<T> MutexInternal<T> {
     pub(crate) unsafe fn create_guard(&self) -> MutexGuard<'_, T> {
         MutexGuard { mutex: self }
     }
+
+    #[cfg(feature = "reentrant")]
+    #[inline(always)]
+    pub(crate) fn has_waiters(&self) -> bool {
+        let ptr = self.queue.load(Ordering::Relaxed);
+        ptr != UNLOCKED && ptr != LOCKED && ptr != UPDATING
+    }
 }
 
 /// A future that represents a pending asynchronous lock acquisition request.
@@ -786,6 +793,12 @@ impl<T> Mutex<T> {
     #[inline(always)]
     pub fn lock_async(&self) -> AsyncLockRequest<'_, T> {
         self.as_async().lock()
+    }
+
+    #[cfg(feature = "reentrant")]
+    #[inline(always)]
+    pub(crate) fn has_waiters(&self) -> bool {
+        self.internal.has_waiters()
     }
 }
 

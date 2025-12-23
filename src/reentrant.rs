@@ -22,7 +22,6 @@ pub struct ReentrantMutex<T> {
     mutex: Mutex<T>,
     owner: AtomicUsize,
     count: Cell<usize>,
-    waiters: AtomicUsize,
 }
 
 // SAFETY: count is only accessed by the owning thread
@@ -36,7 +35,6 @@ impl<T> ReentrantMutex<T> {
             mutex: Mutex::new(v),
             owner: AtomicUsize::new(0),
             count: Cell::new(0),
-            waiters: AtomicUsize::new(0),
         }
     }
 
@@ -47,7 +45,7 @@ impl<T> ReentrantMutex<T> {
 
     #[inline]
     fn has_waiters(&self) -> bool {
-        self.waiters.load(Ordering::Relaxed) > 0
+        self.mutex.has_waiters()
     }
 
     #[inline]
@@ -64,7 +62,6 @@ impl<T> ReentrantMutex<T> {
 
     #[inline]
     fn acquired<'a>(&'a self, tid: usize, guard: MutexGuard<'a, T>) -> ReentrantMutexGuard<'a, T> {
-        self.waiters.fetch_sub(1, Ordering::Relaxed);
         self.owner.store(tid, Ordering::Relaxed);
         self.count.set(1);
         ReentrantMutexGuard {
@@ -83,7 +80,6 @@ impl<T> ReentrantMutex<T> {
             return g;
         }
 
-        self.waiters.fetch_add(1, Ordering::Relaxed);
         self.acquired(tid, self.mutex.lock())
     }
 
@@ -93,8 +89,6 @@ impl<T> ReentrantMutex<T> {
         if let Some(g) = self.reentrant_guard(tid) {
             return g;
         }
-
-        self.waiters.fetch_add(1, Ordering::Relaxed);
 
         let guard = self
             .mutex
