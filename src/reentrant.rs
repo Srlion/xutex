@@ -9,7 +9,7 @@ use crate::{Mutex, MutexGuard};
 // Thanks to https://github.com/Amanieu/parking_lot/blob/f989a09dbb391bd4b0920c618234e5d3c151ea76/src/remutex.rs#L18
 #[inline]
 fn thread_id() -> usize {
-    thread_local!(static KEY: u8 = 0);
+    thread_local!(static KEY: u8 = const { 0 });
     KEY.with(|x| NonZeroUsize::new(x as *const _ as usize).unwrap())
         .get()
 }
